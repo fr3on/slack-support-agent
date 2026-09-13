@@ -450,6 +450,8 @@ class SlackEndpoint(Endpoint):
         thread_history = self._apply_context_scope(
             thread_history, settings.get("context_scope", "full_thread"), ctx.event_ts
         )
+        if settings.get("summarize_thread_history", False):
+            thread_history = self._summarize_thread_history(thread_history)
 
         uploaded_files = self._upload_slack_files(
             client, ctx, settings.get("bot_token"), event.get("files", [])
@@ -604,6 +606,34 @@ class SlackEndpoint(Endpoint):
         if scope == "last_message":
             return without_trigger[-1:]
         return thread_history
+
+    _SUMMARY_INSTRUCTION = (
+        "Summarize this Slack conversation for a support agent picking it up. "
+        "Preserve concrete facts: names, IDs, platforms/SDKs mentioned, error "
+        "messages, and any information the user has already provided, so the "
+        "agent doesn't need to ask for it again. Keep it concise."
+    )
+
+    def _summarize_thread_history(self, thread_history: List[ThreadMessage]) -> List[ThreadMessage]:
+        """Condenses thread_history into a single AI-generated summary message,
+        via Dify's built-in system summarization model. Short transcripts are
+        returned unchanged by the SDK itself (no LLM call), so this is safe to
+        call unconditionally."""
+        if not thread_history:
+            return thread_history
+
+        transcript = "\n".join(
+            f"{m.participant_name or m.participant_id}: {m.content}" for m in thread_history
+        )
+        try:
+            summary = self.session.model.summary.invoke(
+                text=transcript, instruction=self._SUMMARY_INSTRUCTION
+            )
+        except Exception as e:
+            logger.warning("Thread history summarization failed, sending raw history instead: %s", e)
+            return thread_history
+
+        return [ThreadMessage(role="user", participant_id="summary", content=summary, participant_name="Thread Summary")]
 
     @staticmethod
     def _substitute_mentions(text: str, user_display_names: Mapping[str, str]) -> str:

@@ -67,6 +67,15 @@ settings:
           pt_BR: Mensagem anterior à menção
           ja_JP: メンション直前のメッセージのみ
     default: full_thread
+  - name: summarize_thread_history
+    type: boolean
+    required: false
+    label:
+      en_US: Summarize Thread History
+      zh_Hans: 总结线程历史
+      pt_BR: Resumir Histórico da Thread
+      ja_JP: スレッド履歴を要約する
+    default: false
   - name: allowed_channel
     type: text-input
     required: false
