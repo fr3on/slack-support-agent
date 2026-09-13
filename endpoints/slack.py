@@ -460,6 +460,10 @@ class SlackEndpoint(Endpoint):
             "query": self._substitute_mentions(message_text, user_display_names),
             "inputs": self._build_invoke_inputs(ctx, thread_history, user_display_names, uploaded_files),
             "response_mode": "blocking",
+            # Attributes the conversation to this Slack channel/DM in Dify's
+            # own Logs and Messages API, instead of every Slack conversation
+            # falling back to one shared anonymous end user.
+            "user": f"slack-{ctx.channel}",
         }
         if conversation_id is not None:
             invoke_params["conversation_id"] = conversation_id
