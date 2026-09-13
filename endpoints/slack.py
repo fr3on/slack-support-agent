@@ -369,6 +369,10 @@ class SlackEndpoint(Endpoint):
         client = WebClient(token=settings.get("bot_token"))
         message_text = self._extract_message_text(event)
 
+        # Captured before the pre-append below, so we can tell whether this
+        # thread had any history *before* this message - see
+        # _fetch_thread_messages for why that distinction matters.
+        had_cached_history = bool(self._load_cached_history(ctx.channel, ctx.conversation_ts))
         self._append_thread_message(ctx.channel, ctx.conversation_ts, self._event_to_cache_entry(event))
 
         blocked = self._enforce_allowed_channel(client, ctx, settings, is_dm)
@@ -376,7 +380,7 @@ class SlackEndpoint(Endpoint):
             return blocked
 
         try:
-            return self._respond(client, ctx, settings, event, message_text)
+            return self._respond(client, ctx, settings, event, message_text, had_cached_history)
         except Exception as e:
             return self._handle_invoke_error(client, ctx, settings, e)
 
@@ -430,11 +434,17 @@ class SlackEndpoint(Endpoint):
     # ------------------------------------------------------- app invocation
 
     def _respond(
-        self, client: WebClient, ctx: RoutingContext, settings: Mapping, event: Mapping, message_text: str
+        self,
+        client: WebClient,
+        ctx: RoutingContext,
+        settings: Mapping,
+        event: Mapping,
+        message_text: str,
+        had_cached_history: bool,
     ) -> Response:
         conversation_id = self._get_conversation_id(ctx.channel, ctx.conversation_ts)
 
-        raw_messages = self._fetch_thread_messages(client, ctx)
+        raw_messages = self._fetch_thread_messages(client, ctx, had_cached_history)
         user_display_names = self._resolve_display_names(client, raw_messages)
         thread_history, is_first_message = self._build_thread_history(raw_messages, user_display_names)
         thread_history = self._apply_context_scope(
@@ -468,20 +478,54 @@ class SlackEndpoint(Endpoint):
                 status=200, response=f"Error sending message to Slack: {e}", content_type="text/plain"
             )
 
-    def _fetch_thread_messages(self, client: WebClient, ctx: RoutingContext) -> List[Dict[str, Any]]:
-        """Raw Slack messages for this thread/DM, from cache if present, else
-        fetched from Slack. Only falls back to Slack's API when we have a
-        real thread ts - the synthetic DM anchor isn't one, and the cache is
-        never empty here anyway since the triggering message was already
-        appended to it in `_handle_reply`."""
+    def _fetch_thread_messages(
+        self, client: WebClient, ctx: RoutingContext, had_cached_history: bool
+    ) -> List[Dict[str, Any]]:
+        """Raw Slack messages for this thread/DM.
+
+        `had_cached_history` must reflect whether the cache had anything in it
+        *before* the current message was appended - checking cache emptiness
+        after that append would always find at least the just-added message,
+        permanently hiding whether this thread's older context was ever
+        fetched. That matters because our local cache entries expire after
+        CACHE_DURATION (24h): a thread that's been quiet for a day looks
+        "empty" locally even though Slack still has the full history, and
+        without this distinction we'd never re-fetch it - the linked app
+        would silently see only the newest message and lose all older
+        context. Only falls back to Slack's API when we have a real thread ts
+        - the synthetic DM anchor isn't one.
+        """
         messages = self._load_cached_history(ctx.channel, ctx.conversation_ts)
-        if messages or not ctx.reply_thread_ts:
+        if had_cached_history or not ctx.reply_thread_ts:
             return messages
 
-        messages = self._fetch_replies_with_retry(client, ctx)
-        for m in messages:
-            self._append_thread_message(ctx.channel, ctx.conversation_ts, m)
-        return messages
+        fetched = self._fetch_replies_with_retry(client, ctx)
+        return self._merge_and_cache_messages(ctx.channel, ctx.conversation_ts, messages, fetched)
+
+    def _merge_and_cache_messages(
+        self,
+        channel: str,
+        conversation_ts: str,
+        existing: List[Dict[str, Any]],
+        fetched: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Merges freshly fetched Slack messages into the cached list,
+        de-duplicating by `ts` (Slack's fetch includes the current triggering
+        message too, which is already in `existing`), sorts chronologically,
+        and persists the result as the new cache contents."""
+        merged = list(existing)
+        seen_ts = {m.get("ts") for m in merged}
+        for m in fetched:
+            if m.get("ts") not in seen_ts:
+                merged.append(m)
+                seen_ts.add(m.get("ts"))
+        merged.sort(key=lambda m: float(m.get("ts") or 0))
+
+        now = time.time()
+        for m in merged:
+            m.setdefault("saved_at", now)
+        self._write_cache(channel, conversation_ts, merged)
+        return merged
 
     def _fetch_replies_with_retry(self, client: WebClient, ctx: RoutingContext) -> List[Dict[str, Any]]:
         try:
