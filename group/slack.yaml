@@ -76,6 +76,20 @@ settings:
       pt_BR: Resumir Histórico da Thread
       ja_JP: スレッド履歴を要約する
     default: false
+  - name: summarization_model
+    type: model-selector
+    scope: llm
+    required: false
+    label:
+      en_US: Summarization Model
+      zh_Hans: 摘要模型
+      pt_BR: Modelo de Resumo
+      ja_JP: 要約に使用するモデル
+    placeholder:
+      en_US: "Leave blank to use Dify's default system reasoning model"
+      zh_Hans: "留空则使用 Dify 的默认系统推理模型"
+      pt_BR: "Deixe em branco para usar o modelo de raciocínio padrão do Dify"
+      ja_JP: "空欄の場合はDifyのデフォルトのシステム推論モデルを使用します"
   - name: allowed_channel
     type: text-input
     required: false

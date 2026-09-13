@@ -34,7 +34,8 @@ Connects Slack to a Dify chat app: reply within Slack threads and to direct mess
 | Bot Token | Yes | Your Slack bot's `xoxb-...` token. |
 | Allowed Channel | No | Restrict the bot to one channel, in `#channel` format. Leave blank to allow all channels. Doesn't apply to DMs. |
 | Thread Context Sent to App | No | How much thread history to send with each reply: **Full thread** (default), **Root message only**, or **Message right before the mention**. |
-| Summarize Thread History | No | Condense the selected thread history into a single AI-generated summary (via Dify's system summarization model) before sending it, instead of the raw message list. Short conversations are sent as-is with no extra cost. |
+| Summarize Thread History | No | Condense the selected thread history into a single AI-generated summary before sending it, instead of the raw message list. Short conversations are sent as-is with no extra cost. |
+| Summarization Model | No | Which model to use for the above. Leave blank to use Dify's default system reasoning model; pick a specific model for explicit control over cost/quality. |
 | Broadcast First Reply | No | Also post the bot's first reply in a thread to the channel itself, not just the thread. |
 | Allow Retry | No | Process Slack's automatic retries of a webhook delivery instead of ignoring them. Off by default to avoid duplicate replies. |
 | Skip App Timeout Error Notifications | No | If the linked app times out, stay silent instead of posting an error message to Slack. |

@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Mapping, Optional
 
 import requests
 from dify_plugin import Endpoint
+from dify_plugin.entities.model.message import SystemPromptMessage, UserPromptMessage
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from werkzeug import Request, Response
@@ -451,7 +452,7 @@ class SlackEndpoint(Endpoint):
             thread_history, settings.get("context_scope", "full_thread"), ctx.event_ts
         )
         if settings.get("summarize_thread_history", False):
-            thread_history = self._summarize_thread_history(thread_history)
+            thread_history = self._summarize_thread_history(thread_history, settings.get("summarization_model"))
 
         uploaded_files = self._upload_slack_files(
             client, ctx, settings.get("bot_token"), event.get("files", [])
@@ -614,11 +615,18 @@ class SlackEndpoint(Endpoint):
         "agent doesn't need to ask for it again. Keep it concise."
     )
 
-    def _summarize_thread_history(self, thread_history: List[ThreadMessage]) -> List[ThreadMessage]:
-        """Condenses thread_history into a single AI-generated summary message,
-        via Dify's built-in system summarization model. Short transcripts are
-        returned unchanged by the SDK itself (no LLM call), so this is safe to
-        call unconditionally."""
+    def _summarize_thread_history(
+        self, thread_history: List[ThreadMessage], model_config: Optional[Mapping] = None
+    ) -> List[ThreadMessage]:
+        """Condenses thread_history into a single AI-generated summary message.
+
+        With no `model_config` (the "Summarization Model" setting left unset),
+        uses Dify's built-in system summarization model - short transcripts
+        are returned unchanged by the SDK itself (no LLM call), so this is
+        safe to call unconditionally. When a specific model is configured,
+        calls it directly instead, since the system-summary API has no way to
+        pick a model.
+        """
         if not thread_history:
             return thread_history
 
@@ -626,9 +634,20 @@ class SlackEndpoint(Endpoint):
             f"{m.participant_name or m.participant_id}: {m.content}" for m in thread_history
         )
         try:
-            summary = self.session.model.summary.invoke(
-                text=transcript, instruction=self._SUMMARY_INSTRUCTION
-            )
+            if model_config:
+                result = self.session.model.llm.invoke(
+                    model_config=dict(model_config),
+                    prompt_messages=[
+                        SystemPromptMessage(content=self._SUMMARY_INSTRUCTION),
+                        UserPromptMessage(content=transcript),
+                    ],
+                    stream=False,
+                )
+                summary = result.message.content
+            else:
+                summary = self.session.model.summary.invoke(
+                    text=transcript, instruction=self._SUMMARY_INSTRUCTION
+                )
         except Exception as e:
             logger.warning("Thread history summarization failed, sending raw history instead: %s", e)
             return thread_history
