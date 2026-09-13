@@ -13,6 +13,8 @@ description:
   zh_Hans: "将 Slack 连接到 Dify 智能体的插件，支持线程回复（可选将首次回复发送至频道）和私信，支持 mrkdwn 格式、线程/私信历史和用户列表、可配置的上下文范围，并可选限制使用频道。"
   pt_BR: "Conecta o Slack a um agente Dify para respostas em thread (opcionalmente postando a primeira resposta no canal) e mensagens diretas, com formatação mrkdwn, histórico de conversa em thread/DM e lista de usuários, escopo de contexto configurável, e restrição opcional de canais de uso."
 icon: icon.svg
+repo: https://github.com/fr3on/slack-support-agent
+contact: ahmed@0x200.com
 tags: ['productivity','social']
 resource:
   memory: 536870912

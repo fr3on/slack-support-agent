@@ -12,6 +12,7 @@ Connects Slack to a Dify chat app: reply within Slack threads and to direct mess
 - [Install](#install)
 - [Setup](#setup)
 - [Usage in your Dify app](#usage-in-your-dify-app)
+- [Support](#support)
 
 ### Features
 
@@ -94,3 +95,9 @@ Start.thread_history
 # User list
 Start.thread_users
 ```
+
+### Support
+
+- Source repository: https://github.com/fr3on/slack-support-agent
+- Issues / questions: https://github.com/fr3on/slack-support-agent/issues
+- Contact: [@fr3on](https://github.com/fr3on) on GitHub
