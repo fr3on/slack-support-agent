@@ -76,7 +76,7 @@ settings:
       pt_BR: Excluir Mensagens Entre Usuários
       ja_JP: ユーザー間のメッセージを除外する
     default: false
-
+  - name: summarize_thread_history
     type: boolean
     required: false
     label:
