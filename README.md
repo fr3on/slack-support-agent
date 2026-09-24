@@ -1,6 +1,6 @@
 ## Slack Support Agent
 
-**Version:** 0.0.2
+**Version:** 0.0.3
 **Type:** extension
 
 Connects Slack to a Dify chat app: reply within Slack threads and to direct messages sent straight to the bot, with conversation history, user info, file uploads, and `mrkdwn` formatting handled for you.
@@ -34,6 +34,7 @@ Connects Slack to a Dify chat app: reply within Slack threads and to direct mess
 | Bot Token | Yes | Your Slack bot's `xoxb-...` token. |
 | Allowed Channel | No | Restrict the bot to one channel, in `#channel` format. Leave blank to allow all channels. Doesn't apply to DMs. |
 | Thread Context Sent to App | No | How much thread history to send with each reply: **Full thread** (default), **Root message only**, or **Message right before the mention**. |
+| Exclude User-to-User Messages | No | When on, messages people send to each other in a thread are kept away from the linked app: it only receives the thread's root message, the agent's own replies, and messages that @mention the agent (DMs are unaffected, since they are always with the agent). Those messages are also no longer cached. Default: off (the full thread is sent). |
 | Summarize Thread History | No | Condense the selected thread history into a single AI-generated summary before sending it, instead of the raw message list. Short conversations are sent as-is with no extra cost. |
 | Summarization Model | No | Which model to use for the above. Leave blank to use Dify's default system reasoning model; pick a specific model for explicit control over cost/quality. |
 | Broadcast First Reply | No | Also post the bot's first reply in a thread to the channel itself, not just the thread. |
@@ -65,6 +66,8 @@ groups:read, im:read, files:read
 | `message.im` | Reply to direct messages sent to the bot |
 | `message.channels` | Cache messages in public channel threads |
 | `message.groups` | Cache messages in private channel threads |
+
+**Subscribe only under "Subscribe to bot events".** Do not add `message.im` or `im_history_changed` under "Subscribe to events on behalf of users": those deliver the installing user's private DMs with other people, which are not conversations with the bot. The plugin ignores DMs that Slack didn't deliver under the bot's own authorization as a safeguard, but removing the user-level events keeps that data from being sent to the plugin at all. If you turn on **Exclude User-to-User Messages**, `message.channels`/`message.groups` are no longer needed (channel context then comes from @mentions and the first thread fetch), and can be removed to stop human channel chatter reaching the plugin.
 
 The `message.channels`/`message.groups` events feed a caching layer that keeps thread context available without repeatedly hitting Slack's thread-history endpoint, which is rate-limited to about 1 request per minute.
 

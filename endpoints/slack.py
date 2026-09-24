@@ -26,6 +26,9 @@ MENTION_PATTERN = re.compile(r"<@([A-Za-z0-9]+)>")
 LOOSE_MENTION_PATTERN = re.compile(r"<@([^>]+)>")
 SLACK_BLOCK_TEXT_LIMIT = 3000  # https://api.slack.com/reference/block-kit/composition-objects#text__fields
 DM_CONVERSATION_ANCHOR = "dm-main"
+# Message subtypes that are real user messages (a file upload with a caption,
+# a thread reply also sent to the channel) rather than edits/deletes/joins.
+CONVERSATION_SUBTYPES = ("file_share", "thread_broadcast")
 
 
 class SlackMarkdownConverter:
@@ -56,7 +59,7 @@ class SlackMarkdownConverter:
             (re.compile(r"__(.+?)__", re.MULTILINE), r"*\1*"),  # Underline as bold
             (re.compile(r"\[(.+?)\]\((.+?)\)", re.MULTILINE), r"<\2|\1>"),  # Links
             (re.compile(r"`(.+?)`", re.MULTILINE), r"`\1`"),  # Inline code
-            (re.compile(r"^> (.+)", re.MULTILINE), r"> \1"),  # Blockquote
+            (re.compile(r"^&gt; (.+)", re.MULTILINE), r"> \1"),  # Blockquote (">" is escaped first, see convert)
             (re.compile(r"^(---|\*\*\*|___)$", re.MULTILINE), r"──────────"),  # Horizontal line
             (re.compile(r"~~(.+?)~~", re.MULTILINE), r"~\1~"),  # Strikethrough
         ]
@@ -68,7 +71,7 @@ class SlackMarkdownConverter:
             return ""
 
         try:
-            markdown = markdown.strip()
+            markdown = self._escape_slack_control_chars(markdown.strip())
             self.table_replacements = {}
             markdown = self._convert_tables(markdown)
 
@@ -80,7 +83,16 @@ class SlackMarkdownConverter:
 
             return result.encode(self.encoding).decode(self.encoding)
         except Exception:
-            return markdown
+            return self._escape_slack_control_chars(markdown)
+
+    @staticmethod
+    def _escape_slack_control_chars(text: str) -> str:
+        """Slack treats &, < and > as control characters: `<!channel>`,
+        `<!here>` and `<@U123>` in model output would otherwise ping people
+        (a prompt-injection route to mass pings), and a stray "<" can
+        swallow text as a malformed link. Escaped up front; the converter
+        then re-adds the < > it needs for real links."""
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     def _convert_tables(self, markdown: str) -> str:
         table_pattern = re.compile(
@@ -212,6 +224,7 @@ class SlackEndpoint(Endpoint):
     CACHE_PREFIX = "thread-cache"
     CONVERSATION_PREFIX = "slack"
     CACHE_DURATION = 60 * 60 * 24  # 1 day
+    MAX_RATE_LIMIT_WAIT = 20  # seconds
 
     # ---------------------------------------------------------------- cache
 
@@ -247,12 +260,20 @@ class SlackEndpoint(Endpoint):
                 self._cache_key(channel, conversation_ts),
                 json.dumps({"messages": messages}).encode("utf-8"),
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed to write thread cache (plugin storage full?): %s", e)
 
     def _append_thread_message(self, channel: str, conversation_ts: str, message: Mapping) -> None:
         messages = self._load_cached_history(channel, conversation_ts)
         msg = dict(message)
+        # Slack can deliver the same message as both an app_mention and a
+        # message event, so never store one ts twice.
+        existing = next((m for m in messages if msg.get("ts") and m.get("ts") == msg.get("ts")), None)
+        if existing is not None:
+            if msg.get("to_agent"):
+                existing["to_agent"] = True
+                self._write_cache(channel, conversation_ts, messages)
+            return
         msg["saved_at"] = time.time()
         messages.append(msg)
         self._write_cache(channel, conversation_ts, messages)
@@ -270,8 +291,8 @@ class SlackEndpoint(Endpoint):
                 self._conversation_key(channel, conversation_ts),
                 conversation_id.encode("utf-8"),
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed to store conversation id (plugin storage full?): %s", e)
 
     # -------------------------------------------------------------- routing
 
@@ -294,10 +315,24 @@ class SlackEndpoint(Endpoint):
         event = data.get("event") or {}
         is_dm = self._is_dm_message(event)
 
+        # Events subscribed "on behalf of users" (Slack app > Event
+        # Subscriptions) also deliver DMs between a user who authorized the
+        # app and *other people*. Those look identical to a DM with the bot,
+        # so only handle DMs Slack delivered under the bot's own
+        # authorization. This also stops a DM to the bot being answered twice
+        # when both the bot and user subscriptions deliver it.
+        if is_dm and not self._delivered_to_bot(data):
+            return Response(status=200, response="ok")
+
+        # Never answer other bots (or ourselves): two bots mentioning each
+        # other would otherwise loop forever.
+        if event.get("type") == "app_mention" and event.get("bot_id"):
+            return Response(status=200, response="ok")
+
         if event.get("type") == "app_mention" or is_dm:
             return self._handle_reply(event, settings, is_dm)
         if event.get("type") == "message":
-            return self._handle_passive_message(event)
+            return self._handle_passive_message(event, settings)
         return Response(status=200, response="ok")
 
     @staticmethod
@@ -305,10 +340,21 @@ class SlackEndpoint(Endpoint):
         if settings.get("allow_retry"):
             return False
         retry_num = r.headers.get("X-Slack-Retry-Num")
-        return bool(
-            r.headers.get("X-Slack-Retry-Reason") == "http_timeout"
-            or (retry_num is not None and int(retry_num) > 0)
-        )
+        try:
+            retried = retry_num is not None and int(retry_num) > 0
+        except ValueError:
+            retried = True
+        return bool(r.headers.get("X-Slack-Retry-Reason") == "http_timeout" or retried)
+
+    @staticmethod
+    def _delivered_to_bot(data: Mapping) -> bool:
+        """Whether Slack delivered this event under the bot's authorization
+        (as opposed to a user's). If the payload carries no authorization
+        info, assume it did rather than drop real DMs."""
+        authorizations = data.get("authorizations")
+        if not isinstance(authorizations, list) or not authorizations:
+            return True
+        return any(a.get("is_bot") for a in authorizations if isinstance(a, Mapping))
 
     @staticmethod
     def _is_dm_message(event: Mapping) -> bool:
@@ -320,26 +366,43 @@ class SlackEndpoint(Endpoint):
             event.get("type") == "message"
             and event.get("channel_type") == "im"
             and not event.get("bot_id")
-            and not event.get("subtype")
-            and event.get("text")
+            and event.get("subtype") in (None, *CONVERSATION_SUBTYPES)
+            and (event.get("text") or event.get("files"))
         )
 
     @staticmethod
-    def _event_to_cache_entry(event: Mapping) -> Dict[str, Any]:
-        return {
+    def _event_to_cache_entry(event: Mapping, to_agent: bool = False) -> Dict[str, Any]:
+        entry = {
             "ts": event.get("ts"),
             "text": event.get("text", ""),
             "user": event.get("user"),
             "bot_id": event.get("bot_id"),
         }
+        if to_agent:
+            # Set for messages that were addressed to the agent (an @mention
+            # or a DM), so they survive the "agent conversation only" filter.
+            entry["to_agent"] = True
+        return entry
 
     # ------------------------------------------------- passive caching path
 
-    def _handle_passive_message(self, event: Mapping) -> Response:
+    def _handle_passive_message(self, event: Mapping, settings: Mapping) -> Response:
         """Messages that aren't a mention or a DM (e.g. other people replying
         in a channel thread the bot is already tracking) are cached silently,
         without invoking the linked app, so full thread context is available
         next time the bot is mentioned in that thread."""
+        # Edits, deletions, joins/leaves and other housekeeping events are not
+        # conversation messages - caching them would insert blank/garbage
+        # entries into the history.
+        if event.get("subtype") not in (None, *CONVERSATION_SUBTYPES) or not event.get("text"):
+            return Response(status=200, response="ok")
+
+        # With "exclude user-to-user messages" on, human chatter is neither
+        # cached nor forwarded: messages addressed to the agent arrive via the
+        # mention/DM path and the agent's own replies are cached when posted.
+        if settings.get("exclude_user_to_user_messages", False):
+            return Response(status=200, response="ok")
+
         channel = event.get("channel", "")
         thread_ts = event.get("thread_ts") or event.get("ts")
         if self._is_thread_recognized(channel, thread_ts):
@@ -369,16 +432,29 @@ class SlackEndpoint(Endpoint):
         )
         client = WebClient(token=settings.get("bot_token"))
         message_text = self._extract_message_text(event)
+        if not message_text.strip() and event.get("files"):
+            message_text = "(The user attached file(s) without any text.)"
 
-        # Captured before the pre-append below, so we can tell whether this
-        # thread had any history *before* this message - see
-        # _fetch_thread_messages for why that distinction matters.
-        had_cached_history = bool(self._load_cached_history(ctx.channel, ctx.conversation_ts))
-        self._append_thread_message(ctx.channel, ctx.conversation_ts, self._event_to_cache_entry(event))
+        # Slack can deliver the same message twice without retry headers
+        # (e.g. through two event subscriptions). If we've already taken this
+        # one, don't answer twice - unless retries are explicitly allowed.
+        history = self._load_cached_history(ctx.channel, ctx.conversation_ts)
+        if not settings.get("allow_retry") and any(
+            m.get("ts") == event.get("ts") and m.get("to_agent") for m in history
+        ):
+            return Response(status=200, response="ok")
 
         blocked = self._enforce_allowed_channel(client, ctx, settings, is_dm)
         if blocked is not None:
             return blocked
+
+        # Captured before the pre-append below, so we can tell whether this
+        # thread had any history *before* this message - see
+        # _fetch_thread_messages for why that distinction matters.
+        had_cached_history = bool(history)
+        self._append_thread_message(
+            ctx.channel, ctx.conversation_ts, self._event_to_cache_entry(event, to_agent=True)
+        )
 
         try:
             return self._respond(client, ctx, settings, event, message_text, had_cached_history)
@@ -419,7 +495,7 @@ class SlackEndpoint(Endpoint):
             )
             return Response(status=200, response="ok", content_type="text/plain")
 
-        if actual_channel == allowed_channel:
+        if actual_channel.lower() == "#" + allowed_channel.lstrip("#").lower():
             return None
 
         self._safe_post(client, ctx, f"Current channel: {actual_channel} is not allowed.")
@@ -429,8 +505,8 @@ class SlackEndpoint(Endpoint):
     def _safe_post(client: WebClient, ctx: RoutingContext, text: str) -> None:
         try:
             client.chat_postMessage(channel=ctx.channel, thread_ts=ctx.reply_thread_ts, text=text)
-        except SlackApiError:
-            pass
+        except Exception as e:
+            logger.warning("Failed to post notice to Slack: %s", e)
 
     # ------------------------------------------------------- app invocation
 
@@ -446,8 +522,14 @@ class SlackEndpoint(Endpoint):
         conversation_id = self._get_conversation_id(ctx.channel, ctx.conversation_ts)
 
         raw_messages = self._fetch_thread_messages(client, ctx, had_cached_history)
+        # Decided from the unfiltered thread: "first message" means the thread
+        # has had no earlier messages at all, whatever the filter keeps.
+        is_first_message = len(raw_messages) == 1
+        if settings.get("exclude_user_to_user_messages", False) and not ctx.is_dm:
+            raw_messages = self._filter_agent_conversation(client, ctx, raw_messages)
         user_display_names = self._resolve_display_names(client, raw_messages)
-        thread_history, is_first_message = self._build_thread_history(raw_messages, user_display_names)
+        own_bot_id = self._get_bot_identity(client).get("bot_id")
+        thread_history, _ = self._build_thread_history(raw_messages, user_display_names, own_bot_id)
         thread_history = self._apply_context_scope(
             thread_history, settings.get("context_scope", "full_thread"), ctx.event_ts
         )
@@ -471,8 +553,20 @@ class SlackEndpoint(Endpoint):
         if conversation_id is not None:
             invoke_params["conversation_id"] = conversation_id
 
-        response = self.session.app.chat.invoke(**invoke_params)
-        answer = response.get("answer")
+        try:
+            response = self.session.app.chat.invoke(**invoke_params)
+        except Exception as e:
+            # The stored Dify conversation may have been deleted; without this
+            # every later message in the thread would fail forever. Start a
+            # fresh conversation once instead.
+            msg = str(e).lower()
+            if conversation_id is not None and "conversation" in msg and ("not exist" in msg or "not found" in msg):
+                logger.warning("Dify conversation %s no longer exists, starting a new one", conversation_id)
+                invoke_params.pop("conversation_id", None)
+                response = self.session.app.chat.invoke(**invoke_params)
+            else:
+                raise
+        answer = (response.get("answer") or "").strip() or "Sorry, I couldn't come up with an answer to that."
 
         new_conversation_id = response.get("conversation_id")
         if new_conversation_id:
@@ -503,7 +597,11 @@ class SlackEndpoint(Endpoint):
         - the synthetic DM anchor isn't one.
         """
         messages = self._load_cached_history(ctx.channel, ctx.conversation_ts)
-        if had_cached_history or not ctx.reply_thread_ts:
+        # A message that isn't inside an existing Slack thread has no earlier
+        # history to fetch - skip the API call (thread-history calls are
+        # heavily rate limited).
+        if had_cached_history or not ctx.raw_thread_ts:
+            messages.sort(key=lambda m: float(m.get("ts") or 0))
             return messages
 
         fetched = self._fetch_replies_with_retry(client, ctx)
@@ -542,7 +640,15 @@ class SlackEndpoint(Endpoint):
                 logger.warning("Error getting thread history: %s", e)
                 return []
 
-            retry_after = int(e.response.get("headers", {}).get("Retry-After", 60))
+            try:
+                retry_after = int((getattr(e.response, "headers", None) or {}).get("Retry-After", 30))
+            except (TypeError, ValueError):
+                retry_after = 30
+            if retry_after > self.MAX_RATE_LIMIT_WAIT:
+                # Sleeping this long would outlast the Slack/Dify request;
+                # answer with what we have cached instead.
+                logger.warning("Slack rate limit wait of %ss too long, skipping thread fetch", retry_after)
+                return []
             self._safe_post(
                 client, ctx, f"Rate limit reached when retrieving thread. Retrying in {retry_after} seconds..."
             )
@@ -552,6 +658,55 @@ class SlackEndpoint(Endpoint):
             except SlackApiError as retry_error:
                 logger.warning("Error getting thread history after retry: %s", retry_error)
                 return []
+
+    BOT_IDENTITY_KEY = "bot-identity"
+
+    def _get_bot_identity(self, client: WebClient) -> Dict[str, Optional[str]]:
+        """This bot's Slack user id and bot id, cached in plugin storage so
+        auth.test is only called once."""
+        try:
+            raw = self.session.storage.get(self.BOT_IDENTITY_KEY)
+            if raw:
+                return json.loads(raw.decode("utf-8"))
+        except Exception:
+            pass
+        try:
+            info = client.auth_test()
+            identity = {"user_id": info.get("user_id"), "bot_id": info.get("bot_id")}
+        except SlackApiError as e:
+            logger.warning("auth.test failed, cannot identify the bot: %s", e)
+            return {"user_id": None, "bot_id": None}
+        try:
+            self.session.storage.set(self.BOT_IDENTITY_KEY, json.dumps(identity).encode("utf-8"))
+        except Exception:
+            pass
+        return identity
+
+    def _filter_agent_conversation(
+        self, client: WebClient, ctx: RoutingContext, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Keeps only the messages that are part of the conversation with the
+        agent, dropping messages the channel's people sent to each other:
+        the thread's root message (the original question), the agent's own
+        replies, and any message that @mentions the agent. If the bot's
+        identity can't be determined, returns everything unfiltered rather
+        than risk dropping the user's actual question."""
+        identity = self._get_bot_identity(client)
+        bot_user_id, bot_id = identity.get("user_id"), identity.get("bot_id")
+        if not bot_user_id:
+            return messages
+
+        mention = f"<@{bot_user_id}>"
+        root_ts = ctx.raw_thread_ts or ctx.event_ts
+        return [
+            m
+            for m in messages
+            if m.get("ts") == root_ts
+            or m.get("to_agent")
+            or m.get("user") == bot_user_id
+            or (bot_id and m.get("bot_id") == bot_id)
+            or mention in (m.get("text") or "")
+        ]
 
     def _resolve_display_names(self, client: WebClient, messages: List[Dict[str, Any]]) -> Dict[str, str]:
         user_ids: List[str] = []
@@ -564,21 +719,36 @@ class SlackEndpoint(Endpoint):
                     user_ids.append(mentioned_id)
 
         display_names: Dict[str, str] = {}
-        try:
-            for user_id in user_ids:
-                info = client.users_info(user=user_id).get("user", {})
-                name, real_name = info.get("name", ""), info.get("real_name", "")
-                display_names[user_id] = f"{real_name} ({name})" if name else real_name
-        except SlackApiError as e:
-            logger.warning("Error getting user info: %s", e)
+        for user_id in user_ids:
+            # One unresolvable id (deleted user, "U123|name" legacy mention,
+            # a bot id) must not stop the rest from resolving.
+            try:
+                info = client.users_info(user=user_id.split("|")[0]).get("user", {})
+            except SlackApiError as e:
+                logger.warning("Error getting user info for %s: %s", user_id, e)
+                continue
+            name, real_name = info.get("name", ""), info.get("real_name", "")
+            display_names[user_id] = f"{real_name} ({name})" if (name and real_name) else (real_name or name)
         return display_names
 
+    @staticmethod
+    def _is_own_message(msg: Mapping, own_bot_id: Optional[str]) -> bool:
+        """Only this bot's own posts are the assistant's turns; other bots
+        (Jira, GitHub, ...) in the same thread are just other participants.
+        If our identity is unknown, fall back to treating any bot as us."""
+        if not msg.get("bot_id"):
+            return False
+        return own_bot_id is None or msg["bot_id"] == own_bot_id
+
     def _build_thread_history(
-        self, messages: List[Dict[str, Any]], user_display_names: Dict[str, str]
+        self,
+        messages: List[Dict[str, Any]],
+        user_display_names: Dict[str, str],
+        own_bot_id: Optional[str] = None,
     ) -> tuple:
         thread_history = [
             ThreadMessage(
-                role="assistant" if msg.get("bot_id") else "user",
+                role="assistant" if self._is_own_message(msg, own_bot_id) else "user",
                 participant_id=(participant_id := msg.get("user", "unknown")),
                 content=self._substitute_mentions(msg.get("text", ""), user_display_names),
                 ts=msg.get("ts"),
@@ -644,6 +814,8 @@ class SlackEndpoint(Endpoint):
                     stream=False,
                 )
                 summary = result.message.content
+                if isinstance(summary, list):
+                    summary = "".join(getattr(part, "data", "") or "" for part in summary)
             else:
                 summary = self.session.model.summary.invoke(
                     text=transcript, instruction=self._SUMMARY_INSTRUCTION
@@ -660,7 +832,11 @@ class SlackEndpoint(Endpoint):
             user_id = match.group(1)
             return f"@{user_display_names[user_id]}" if user_id in user_display_names else match.group(0)
 
-        return MENTION_PATTERN.sub(replace, text)
+        # Slack HTML-escapes &, < and > in message text; undo that (after
+        # mention substitution, which relies on the literal <@ID> form) so
+        # the app sees what the user actually typed.
+        text = MENTION_PATTERN.sub(replace, text or "")
+        return text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
 
     def _upload_slack_files(
         self, client: WebClient, ctx: RoutingContext, token: str, slack_files: List[Dict[str, Any]]
@@ -673,7 +849,11 @@ class SlackEndpoint(Endpoint):
             if not file_url or not file_name:
                 continue
 
-            resp = requests.get(file_url, headers={"Authorization": f"Bearer {token}"})
+            try:
+                resp = requests.get(file_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+            except requests.RequestException as e:
+                logger.warning("Failed to download file from Slack: %s (%s)", file_name, e)
+                continue
             if resp.status_code != 200:
                 logger.warning(
                     "Failed to download file from Slack: %s, status code=%s", file_name, resp.status_code
@@ -727,7 +907,7 @@ class SlackEndpoint(Endpoint):
             return Response(status=200, response="ok", content_type="text/plain")
 
         self._safe_post(
-            client, ctx, f"Sorry, I'm having trouble processing your request. Please try again later. Error: {err_msg}"
+            client, ctx, f"Sorry, I'm having trouble processing your request. Please try again later. Error: {err_msg[:300]}"
         )
         return Response(
             status=200, response=f"An error occurred: {err_msg}\n{err_trace}", content_type="text/plain"
@@ -740,7 +920,13 @@ class SlackEndpoint(Endpoint):
     ) -> Response:
         converted_answer = SlackMarkdownConverter().convert(answer)
         chunks = self._split_into_chunks(converted_answer, SLACK_BLOCK_TEXT_LIMIT)
-        reply_broadcast = settings.get("first_reply_broadcast", False) and is_first_message
+        # reply_broadcast only makes sense on a threaded reply, never a plain DM message.
+        reply_broadcast = bool(
+            settings.get("first_reply_broadcast", False)
+            and is_first_message
+            and ctx.reply_thread_ts
+            and not ctx.is_dm
+        )
 
         for i, chunk in enumerate(chunks):
             resp = client.chat_postMessage(

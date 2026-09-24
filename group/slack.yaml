@@ -67,7 +67,16 @@ settings:
           pt_BR: Mensagem anterior à menção
           ja_JP: メンション直前のメッセージのみ
     default: full_thread
-  - name: summarize_thread_history
+  - name: exclude_user_to_user_messages
+    type: boolean
+    required: false
+    label:
+      en_US: Exclude User-to-User Messages
+      zh_Hans: 排除用户之间的消息
+      pt_BR: Excluir Mensagens Entre Usuários
+      ja_JP: ユーザー間のメッセージを除外する
+    default: false
+
     type: boolean
     required: false
     label:
