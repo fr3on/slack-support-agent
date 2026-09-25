@@ -1,4 +1,4 @@
-version: 0.0.3
+version: 0.0.4
 type: plugin
 author: fr3on
 name: slack-support-agent
@@ -40,7 +40,7 @@ plugins:
   endpoints:
     - group/slack.yaml
 meta:
-  version: 0.0.3
+  version: 0.0.4
   arch:
     - amd64
     - arm64

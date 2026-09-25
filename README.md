@@ -1,6 +1,6 @@
 ## Slack Support Agent
 
-**Version:** 0.0.3
+**Version:** 0.0.4
 **Type:** extension
 
 Connects Slack to a Dify chat app: reply within Slack threads and to direct messages sent straight to the bot, with conversation history, user info, file uploads, and `mrkdwn` formatting handled for you.
